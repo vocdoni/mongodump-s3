@@ -47,6 +47,7 @@ Optional env vars:
 - `TZ` (default `Etc/UTC`)
 - `RETENTION` (default `6`)
 - `BACKUP_TIMEOUT` (default `1800`; seconds before `mongodump`/`gpg` are killed so a hang fails fast instead of pinning CPU until the next run)
+- `EXPIRE_DAYS` (default `365` ≈ 12 months; used only by `app/lifecycle.sh` / `make lifecycle` to set the Spaces lifecycle expiration window — see [Automatic Deletion of Old Backups](#automatic-deletion-of-old-backups))
 - `EXTRA_MONGODUMP_ARGS` (default empty; example `--db mydb`)
 - `AWS_S3_FORCE_PATH_STYLE` (default `false`; set `true` for MinIO-style endpoints that require path-style addressing)
 - `MONGO_TLS_CA_FILE` (default empty)
@@ -67,18 +68,20 @@ If you run this as a DigitalOcean App Platform scheduled job:
 - Configure `BACKUP_PASSPHRASE` as an encrypted App Platform secret.
 
 ## Schedule Examples
-- Europe/Rome (DST-aware with `TZ=Europe/Rome`), weekly on Sunday at 03:15:
+These drive the container-internal cron (`entrypoint.sh`) only. A DigitalOcean scheduled job ignores `CRON_SCHEDULE` and uses the app spec's own schedule instead.
+
+- Europe/Rome (DST-aware with `TZ=Europe/Rome`), daily at 03:15:
 
 ```
 TZ=Europe/Rome
-CRON_SCHEDULE=15 3 * * 0
+CRON_SCHEDULE=15 3 * * *
 ```
 
-- UTC, weekly on Sunday at 03:15:
+- UTC, daily at 03:15:
 
 ```
 TZ=Etc/UTC
-CRON_SCHEDULE=15 3 * * 0
+CRON_SCHEDULE=15 3 * * *
 ```
 
 ## Object Layout
@@ -153,12 +156,36 @@ volumes:
   - ./certs/ca.pem:/certs/ca.pem:ro
 ```
 
+## Automatic Deletion of Old Backups
+Deletion is handled **server-side by a DigitalOcean Spaces lifecycle rule**, not by the backup job — so no destructive code ever runs against production, and there is no path that can wrongly delete a fresh backup. DO expires objects itself based on each object's `LastModified` age.
+
+Apply (or change) the rule with the one-shot helper:
+
+```bash
+make lifecycle                    # uses EXPIRE_DAYS from .env (default 365 ≈ 12 months)
+make lifecycle EXPIRE_DAYS=730    # override to 24 months
+```
+
+Or run the raw AWS CLI equivalent against the regional endpoint:
+
+```bash
+aws --endpoint-url "$SPACE_ENDPOINT" s3api put-bucket-lifecycle-configuration \
+  --bucket "$SPACE_NAME" \
+  --lifecycle-configuration '{"Rules":[{"ID":"expire-old-mongo-backups","Status":"Enabled","Filter":{"Prefix":"backups/"},"Expiration":{"Days":365}}]}'
+```
+
+Notes:
+- The rule is scoped to `Prefix: backups/`, so each archive and its `.sha256` / `.metadata.json` sidecars expire together; nothing else in the bucket is touched.
+- It applies to **existing** objects immediately (age is measured from `LastModified`), not just new ones.
+- `app/lifecycle.sh` reads the rule back after applying it and logs the result — Spaces has been known to silently no-op, so always confirm it landed.
+- Setting a bucket lifecycle is a bucket-admin operation. A scoped read/write key may return `AccessDenied` for `PutBucketLifecycleConfiguration`; if so, run the helper once with a full-access/owner Spaces key.
+- Verify at any time: `aws --endpoint-url "$SPACE_ENDPOINT" s3api get-bucket-lifecycle-configuration --bucket "$SPACE_NAME"`.
+
 ## Retention and Naming Strategy
-- Retention is **report-only**. The script lists matching `.archive.gz.gpg` objects and logs how many exist versus the configured `RETENTION` value, but it does not delete anything.
+- The backup script's `RETENTION` value is **report-only** and independent of deletion: the script lists matching `.archive.gz.gpg` objects and logs how many exist versus `RETENTION`, but never deletes anything. Actual deletion is governed solely by `EXPIRE_DAYS` via the [Spaces lifecycle rule](#automatic-deletion-of-old-backups).
 - The year/month segments are always based on the UTC backup time (e.g. `2026/05`).
 - The report is scoped to the current month segment (`backups/<YYYY>/<MM>`).
 - Source host information is stored in each backup's metadata sidecar.
-- Delete old backups with a separate, audited process if your production policy allows deletion.
 
 ## Security
 ### Least-Privilege Spaces Credentials

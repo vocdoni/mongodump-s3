@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: build run-once up down logs shell lint
+.PHONY: build run-once lifecycle up down logs shell lint
 
 build:
 	docker build -t do-mongo-weekly-backup:local .
@@ -13,6 +13,11 @@ down:
 
 run-once:
 	docker compose run --rm --entrypoint /app/backup.sh backup
+
+# One-shot: install/update the Spaces lifecycle rule that expires old backups.
+# Override the window with EXPIRE_DAYS, e.g. `make lifecycle EXPIRE_DAYS=3650`.
+lifecycle:
+	docker compose run --rm --entrypoint /app/lifecycle.sh backup
 
 logs:
 	docker compose logs -f --tail=200

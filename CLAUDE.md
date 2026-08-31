@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A small bash-only Docker container that runs `mongodump --archive --gzip` against a MongoDB URI, encrypts the archive with `gpg` symmetric AES-256, and uploads it plus `.sha256` and `.metadata.json` sidecars to S3-compatible storage (DigitalOcean Spaces). Retention is **report-only** — the script never deletes backups. There is no application code beyond the three shell scripts in `app/`; the Dockerfile just adds `awscli`, `gnupg`, `cron`, and MongoDB database tools to `debian:bookworm-slim`.
+A small bash-only Docker container that runs `mongodump --archive --gzip` against a MongoDB URI, encrypts the archive with `gpg` symmetric AES-256, and uploads it plus `.sha256` and `.metadata.json` sidecars to S3-compatible storage (DigitalOcean Spaces). The backup script's `RETENTION` is **report-only** — it never deletes. Actual deletion of old backups is a **server-side Spaces lifecycle rule** (age-based, `EXPIRE_DAYS`) applied once by `app/lifecycle.sh`, independent of the job. There is no application code beyond the shell scripts in `app/`; the Dockerfile just adds `awscli`, `gnupg`, `cron`, and MongoDB database tools to `debian:bookworm-slim`.
 
 ## Commands
 
@@ -12,6 +12,7 @@ A small bash-only Docker container that runs `mongodump --archive --gzip` agains
 make build      # docker build -t do-mongo-weekly-backup:local .
 make up         # build + start cron container (requires .env)
 make run-once   # one-off backup run, bypassing cron
+make lifecycle  # apply/update the Spaces expiration rule (EXPIRE_DAYS, default 365)
 make logs       # follow container logs
 make lint       # shellcheck app/*.sh — the only "test" this repo has
 ```
@@ -22,11 +23,12 @@ Local one-off restore (no docker): `S3_OBJECT_KEY=... ./app/restore.sh` with the
 
 ## Architecture
 
-Three scripts in `app/`, no shared sourced file — `log`, `fail`, `require_env`, and the passphrase-file handling are **duplicated** between `backup.sh` and `restore.sh`. Change both if you change one.
+Four scripts in `app/`, no shared sourced file — `log`, `fail`, `require_env`, the `AWS_S3_FORCE_PATH_STYLE` → `AWS_CONFIG_FILE` translation, and the passphrase-file handling are **duplicated** across `backup.sh`, `restore.sh`, and `lifecycle.sh`. Change all copies if you change one.
 
 - **`entrypoint.sh`** — snapshots the container environment to `/etc/mongo-backup.env` (0600), writes `/etc/cron.d/mongo-backup` from `CRON_SCHEDULE` (uses `CRON_TZ=${TZ}` so cron fires in the configured timezone), optionally runs a backup when `RUN_ON_START=true`, then runs `cron -f` supervised. Requires `CRON_SCHEDULE`; exits 1 without it.
 - **`backup.sh`** — the whole pipeline: validate env → write passphrase to a `mktemp -d` workdir (0600, `trap cleanup EXIT`) → `mongodump | gpg` streamed → sha256 → upload three objects → list objects under the current month prefix and log the count vs `RETENTION` (no deletion).
 - **`restore.sh`** — inverse: download object by `S3_OBJECT_KEY` → verify sha256 against the sidecar (fails hard if the sidecar is missing unless `RESTORE_VERIFY_CHECKSUM=false`) → `gpg --decrypt | mongorestore --archive --gzip` streamed, no intermediate plaintext file.
+- **`lifecycle.sh`** — one-shot admin helper, **not** part of the scheduled job. Applies a Spaces lifecycle rule (`ID=expire-old-mongo-backups`, `Filter.Prefix=backups/`, `Expiration.Days=EXPIRE_DAYS`, default 365) via `put-bucket-lifecycle-configuration`, then reads it back with `get-bucket-lifecycle-configuration`. Re-run to change the window (same `ID` replaces in place). May need a full-access/owner Spaces key — a scoped read/write key can be denied `PutBucketLifecycleConfiguration`.
 
 ### Conventions that must be preserved
 
