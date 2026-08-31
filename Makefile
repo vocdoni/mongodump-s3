@@ -11,12 +11,12 @@ up:
 down:
 	docker compose down
 
-run-once:
+run-once: build
 	docker compose run --rm --entrypoint /app/backup.sh backup
 
 # One-shot: install/update the Spaces lifecycle rule that expires old backups.
 # Override the window with EXPIRE_DAYS, e.g. `make lifecycle EXPIRE_DAYS=3650`.
-lifecycle:
+lifecycle: build
 	docker compose run --rm --entrypoint /app/lifecycle.sh backup
 
 logs:
