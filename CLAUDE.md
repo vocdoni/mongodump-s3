@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A small bash-only Docker container that runs `mongodump --archive --gzip` against a MongoDB URI, encrypts the archive with `gpg` symmetric AES-256, and uploads it plus `.sha256` and `.metadata.json` sidecars to S3-compatible storage (DigitalOcean Spaces). The backup script's `RETENTION` is **report-only** — it never deletes. Actual deletion of old backups is a **server-side Spaces lifecycle rule** (age-based, `EXPIRE_DAYS`) applied once by `app/lifecycle.sh`, independent of the job. There is no application code beyond the shell scripts in `app/`; the Dockerfile just adds `awscli`, `gnupg`, `cron`, and MongoDB database tools to `debian:bookworm-slim`.
+A small bash-only Docker container that runs `mongodump --archive --gzip` against a MongoDB URI, encrypts the archive with `gpg` symmetric AES-256, and uploads it plus `.sha256` and `.metadata.json` sidecars to one or two S3-compatible storage targets (DigitalOcean Spaces, and optionally a second provider for redundancy). The backup script's `RETENTION` is **report-only** — it never deletes. Actual deletion of old backups is a **server-side Spaces lifecycle rule** (age-based, `EXPIRE_DAYS`) applied once by `app/lifecycle.sh`, independent of the job. There is no application code beyond the shell scripts in `app/`; the Dockerfile just adds `awscli`, `gnupg`, `cron`, and MongoDB database tools to `debian:bookworm-slim`.
 
 ## Commands
 
@@ -23,17 +23,24 @@ Local one-off restore (no docker): `S3_OBJECT_KEY=... ./app/restore.sh` with the
 
 ## Architecture
 
-Four scripts in `app/`, no shared sourced file — `log`, `fail`, `require_env`, the `AWS_S3_FORCE_PATH_STYLE` → `AWS_CONFIG_FILE` translation, and the passphrase-file handling are **duplicated** across `backup.sh`, `restore.sh`, and `lifecycle.sh`. Change all copies if you change one.
+Four scripts in `app/`, no shared sourced file — `log`, `fail`, `require_env`, `target_var` (plus `add_target` / `aws_target` in `backup.sh` and `lifecycle.sh`), the `AWS_S3_FORCE_PATH_STYLE` → `AWS_CONFIG_FILE` translation, and the passphrase-file handling are **duplicated** across `backup.sh`, `restore.sh`, and `lifecycle.sh`. Change all copies if you change one.
 
 - **`entrypoint.sh`** — snapshots the container environment to `/etc/mongo-backup.env` (0600), writes `/etc/cron.d/mongo-backup` from `CRON_SCHEDULE` (uses `CRON_TZ=${TZ}` so cron fires in the configured timezone), optionally runs a backup when `RUN_ON_START=true`, then runs `cron -f` supervised. Requires `CRON_SCHEDULE`; exits 1 without it.
-- **`backup.sh`** — the whole pipeline: validate env → write passphrase to a `mktemp -d` workdir (0600, `trap cleanup EXIT`) → `mongodump | gpg` streamed → sha256 → upload three objects → list objects under the current month prefix and log the count vs `RETENTION` (no deletion).
-- **`restore.sh`** — inverse: download object by `S3_OBJECT_KEY` → verify sha256 against the sidecar (fails hard if the sidecar is missing unless `RESTORE_VERIFY_CHECKSUM=false`) → `gpg --decrypt | mongorestore --archive --gzip` streamed, no intermediate plaintext file.
-- **`lifecycle.sh`** — one-shot admin helper, **not** part of the scheduled job. Applies a Spaces lifecycle rule (`ID=expire-old-mongo-backups`, `Filter.Prefix=backups/`, `Expiration.Days=EXPIRE_DAYS`, default 365) via `put-bucket-lifecycle-configuration`, then reads it back with `get-bucket-lifecycle-configuration`. Re-run to change the window (same `ID` replaces in place). May need a full-access/owner Spaces key — a scoped read/write key can be denied `PutBucketLifecycleConfiguration`.
+- **`backup.sh`** — the whole pipeline: resolve + validate storage targets → validate env → write passphrase to a `mktemp -d` workdir (0600, `trap cleanup EXIT`) → `mongodump | gpg` streamed → sha256 → upload three objects **to every target** → per target, list objects under the current month prefix and log the count vs `RETENTION` (no deletion).
+- **`restore.sh`** — inverse: pick one target with `RESTORE_SOURCE` (`primary`|`secondary`, default `primary`) → download object by `S3_OBJECT_KEY` → verify sha256 against the sidecar (fails hard if the sidecar is missing unless `RESTORE_VERIFY_CHECKSUM=false`) → `gpg --decrypt | mongorestore --archive --gzip` streamed, no intermediate plaintext file.
+- **`lifecycle.sh`** — one-shot admin helper, **not** part of the scheduled job. Applies, to **every configured target**, a Spaces lifecycle rule (`ID=expire-old-mongo-backups`, `Filter.Prefix=backups/`, `Expiration.Days=EXPIRE_DAYS`, default 365) via `put-bucket-lifecycle-configuration`, then reads it back with `get-bucket-lifecycle-configuration`. Re-run to change the window (same `ID` replaces in place). May need a full-access/owner Spaces key — a scoped read/write key can be denied `PutBucketLifecycleConfiguration`.
 
 ### Conventions that must be preserved
 
-- **Object key layout**: `s3://<SPACE_NAME>/backups/<YYYY>/<MM>/mongo-<timestamp>.archive.gz.gpg` + `.sha256` + sibling `mongo-<timestamp>.metadata.json`. Timestamps are UTC `YYYYMMDDTHHMMSSZ` so lexicographic order matches time order. `backup.sh` derives the month prefix at start, the filename stamp later — a backup spanning a month boundary writes under the start month.
-- **Upload order is load-bearing**: sidecars go up before the archive. `restore.sh` refuses an archive with no `.sha256`, so a partial upload must never leave the archive as the orphan. Don't reorder these.
+- **Storage targets**: `PRIMARY_*` (with fallback to the legacy unprefixed `SPACE_NAME` /
+  `SPACE_ENDPOINT` / `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` — the live DO app spec relies on
+  this, don't drop it) and an optional `SECONDARY_*`. A half-configured target is fatal; targets are
+  validated before `mongodump` runs. Credentials are passed per `aws` call via `aws_target`, never
+  exported, so a key cannot reach the wrong endpoint. `backup.sh` attempts **all** targets and then
+  exits 1 if any failed — degraded redundancy must turn the job red, not pass quietly.
+
+- **Object key layout** (identical in every target, which is what makes `RESTORE_SOURCE` a one-var switch): `s3://<bucket>/backups/<YYYY>/<MM>/mongo-<timestamp>.archive.gz.gpg` + `.sha256` + sibling `mongo-<timestamp>.metadata.json`. Timestamps are UTC `YYYYMMDDTHHMMSSZ` so lexicographic order matches time order. `backup.sh` derives the month prefix at start, the filename stamp later — a backup spanning a month boundary writes under the start month.
+- **Upload order is load-bearing**: sidecars go up before the archive, per target. `restore.sh` refuses an archive with no `.sha256`, so a partial upload must never leave the archive as the orphan. Don't reorder these.
 - **Cron gets no environment for free.** `entrypoint.sh` must snapshot the env to a file that the cron job sources; cron builds job environments from `/etc/passwd` plus crontab assignments only. Removing that snapshot silently breaks every scheduled backup while `make run-once` keeps working.
 - **`GNUPGHOME` is set to the workdir** in both scripts — gpg aborts fatally when HOME is unwritable, which is the case for non-root App Platform runs.
 - **Passphrase handling**: `BACKUP_PASSPHRASE_FILE` wins over `BACKUP_PASSPHRASE`; the env var is materialized to a temp file and `unset` after. Keep it that way — nothing logs or embeds the passphrase.
