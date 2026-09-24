@@ -17,16 +17,47 @@ require_env() {
   fi
 }
 
+# Reads "<PREFIX>_<NAME>". PRIMARY falls back to the legacy unprefixed name so a
+# deployment configured before multi-target support keeps working untouched.
+# Duplicated in backup.sh and lifecycle.sh -- change all copies.
+target_var() {
+  local prefix="$1" name="$2"
+  local prefixed="${prefix}_${name}"
+  local value="${!prefixed:-}"
+  if [[ -z "$value" && "$prefix" == "PRIMARY" ]]; then
+    value="${!name:-}"
+  fi
+  printf '%s' "$value"
+}
+
 require_env "MONGO_URI"
-require_env "SPACE_NAME"
-require_env "SPACE_ENDPOINT"
-require_env "AWS_ACCESS_KEY_ID"
-require_env "AWS_SECRET_ACCESS_KEY"
 require_env "S3_OBJECT_KEY"
+
+# backup.sh writes identical object keys to every target, so restoring from the
+# secondary copy is a one-variable switch.
+RESTORE_SOURCE="${RESTORE_SOURCE:-primary}"
+case "$RESTORE_SOURCE" in
+  primary) source_prefix="PRIMARY" ;;
+  secondary) source_prefix="SECONDARY" ;;
+  *) fail "RESTORE_SOURCE must be 'primary' or 'secondary', got: ${RESTORE_SOURCE}" ;;
+esac
+
+SPACE_NAME="$(target_var "$source_prefix" SPACE_NAME)"
+SPACE_ENDPOINT="$(target_var "$source_prefix" SPACE_ENDPOINT)"
+AWS_ACCESS_KEY_ID="$(target_var "$source_prefix" AWS_ACCESS_KEY_ID)"
+AWS_SECRET_ACCESS_KEY="$(target_var "$source_prefix" AWS_SECRET_ACCESS_KEY)"
+AWS_S3_FORCE_PATH_STYLE="$(target_var "$source_prefix" AWS_S3_FORCE_PATH_STYLE)"
+AWS_S3_FORCE_PATH_STYLE="${AWS_S3_FORCE_PATH_STYLE:-false}"
+export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+
+for storage_var in SPACE_NAME SPACE_ENDPOINT AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do
+  if [[ -z "${!storage_var}" ]]; then
+    fail "Missing storage config for ${RESTORE_SOURCE} source: ${source_prefix}_${storage_var}"
+  fi
+done
 
 BACKUP_PASSPHRASE="${BACKUP_PASSPHRASE:-}"
 BACKUP_PASSPHRASE_FILE="${BACKUP_PASSPHRASE_FILE:-}"
-AWS_S3_FORCE_PATH_STYLE="${AWS_S3_FORCE_PATH_STYLE:-false}"
 RESTORE_VERIFY_CHECKSUM="${RESTORE_VERIFY_CHECKSUM:-true}"
 EXTRA_MONGORESTORE_ARGS="${EXTRA_MONGORESTORE_ARGS:-}"
 
@@ -69,7 +100,7 @@ else
   [[ -r "$passphrase_file_path" ]] || fail "BACKUP_PASSPHRASE_FILE is not readable: ${passphrase_file_path}"
 fi
 
-log "Starting restore (object_key=${S3_OBJECT_KEY})"
+log "Starting restore (source=${RESTORE_SOURCE}, bucket=${SPACE_NAME}, endpoint=${SPACE_ENDPOINT}, object_key=${S3_OBJECT_KEY})"
 
 log "Downloading encrypted archive"
 aws --endpoint-url "${SPACE_ENDPOINT}" \
