@@ -36,7 +36,6 @@ fi
 
 export AWS_EC2_METADATA_DISABLED=true
 export AWS_PAGER=""
-export AWS_S3_FORCE_PATH_STYLE
 
 workdir="$(mktemp -d)"
 encrypted_archive_path="${workdir}/restore.archive.gz.gpg"
@@ -47,6 +46,19 @@ cleanup() {
   rm -rf "${workdir}"
 }
 trap cleanup EXIT
+
+# gpg aborts outright when it cannot create its home directory, which happens on
+# platforms that hand the process an unwritable HOME (App Platform, non-root).
+export GNUPGHOME="${workdir}/gnupg"
+mkdir -p "${GNUPGHOME}"
+chmod 700 "${GNUPGHOME}"
+
+# The AWS CLI ignores AWS_S3_FORCE_PATH_STYLE (an SDK/Terraform setting); it
+# only takes path-style addressing from its config file.
+if [[ "$AWS_S3_FORCE_PATH_STYLE" == "true" ]]; then
+  export AWS_CONFIG_FILE="${workdir}/aws-config"
+  printf '[default]\ns3 =\n    addressing_style = path\n' >"${AWS_CONFIG_FILE}"
+fi
 
 if [[ -z "$passphrase_file_path" ]]; then
   passphrase_file_path="${workdir}/backup_passphrase.txt"
@@ -92,8 +104,10 @@ if [[ ${#extra_restore_args[@]} -gt 0 ]]; then
   mongorestore_args+=("${extra_restore_args[@]}")
 fi
 
+# --lock-never: private per-run GNUPGHOME (above) means no lock is needed, and
+# gpg's dotlock otherwise spins forever on container overlay filesystems.
 log "Decrypting archive and running mongorestore"
-if ! gpg --batch --yes --pinentry-mode loopback \
+if ! gpg --batch --yes --pinentry-mode loopback --lock-never \
   --passphrase-file "${passphrase_file_path}" \
   --decrypt "${encrypted_archive_path}" \
   | mongorestore "${mongorestore_args[@]}"; then
